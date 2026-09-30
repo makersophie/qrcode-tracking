@@ -2,9 +2,6 @@ const video = document.getElementById('webcam');
 const overlay = document.getElementById('overlay');
 const overlayCtx = overlay.getContext('2d');
 
-let sampleCanvas;
-let sampleCtx;
-
 const VIDEO_CONSTRAINTS = {
   video: {
     width: { ideal: 1920 },
@@ -13,16 +10,26 @@ const VIDEO_CONSTRAINTS = {
   audio: false,
 };
 
-// Approximate size of a QR code in the captured frame, in pixels.
-const QR_SIZE = 150;
-// jsQR only ever returns one decoded symbol per call, so to find multiple
-// codes in a frame we scan overlapping crop windows across the image and
-// decode each one separately. The window is bigger than a code (with room
-// for its quiet zone) and the step is small enough that the overlap between
-// adjacent windows is at least one code-width, so no code can fall entirely
-// across a window boundary and get missed.
-const TILE_SIZE = QR_SIZE * 2;
-const TILE_STEP = QR_SIZE;
+// BarcodeDetector finds every QR code in the full frame in a single call, at
+// any size, so no tiling or size hints are needed. Browsers with a native
+// implementation (Chrome/Edge/Android/Safari) use hardware-backed code; others
+// fall back to the zxing-wasm based polyfill.
+const POLYFILL_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/+esm';
+
+let detector;
+let isDetecting = false;
+
+async function createDetector() {
+  const formats = ['qr_code'];
+  if ('BarcodeDetector' in window) {
+    const supported = await BarcodeDetector.getSupportedFormats();
+    if (supported.includes('qr_code')) {
+      return new BarcodeDetector({ formats });
+    }
+  }
+  const { BarcodeDetector: Polyfill } = await import(POLYFILL_URL);
+  return new Polyfill({ formats });
+}
 
 navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS)
   .then((stream) => {
@@ -32,113 +39,43 @@ navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS)
     console.error('Unable to access webcam:', error);
   });
 
-video.addEventListener('loadedmetadata', () => {
+video.addEventListener('loadedmetadata', async () => {
   overlay.width = video.videoWidth;
   overlay.height = video.videoHeight;
 
-  sampleCanvas = document.createElement('canvas');
-  sampleCanvas.width = video.videoWidth;
-  sampleCanvas.height = video.videoHeight;
-  sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
-
+  detector = await createDetector();
   requestAnimationFrame(tick);
 });
 
 function tick() {
-  if (video.readyState === video.HAVE_ENOUGH_DATA) {
-    sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
-
-    overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
-    for (const qrCode of scanForQRCodes()) {
-      drawBox(qrCode.location);
-      drawLabel(qrCode.location, qrCode.data);
-    }
+  // Detection is async; skip frames while one is in flight rather than queue.
+  if (!isDetecting && video.readyState === video.HAVE_ENOUGH_DATA) {
+    isDetecting = true;
+    detector.detect(video)
+      .then(render)
+      .catch((error) => console.error('Detection failed:', error))
+      .finally(() => { isDetecting = false; });
   }
 
   requestAnimationFrame(tick);
 }
 
-function scanForQRCodes() {
-  const xs = getTilePositions(sampleCanvas.width);
-  const ys = getTilePositions(sampleCanvas.height);
-  const detections = [];
-
-  for (const y of ys) {
-    for (const x of xs) {
-      const tile = sampleCtx.getImageData(x, y, TILE_SIZE, TILE_SIZE);
-      const qrCode = jsQR(tile.data, TILE_SIZE, TILE_SIZE);
-      if (qrCode) {
-        detections.push(offsetQRCode(qrCode, x, y));
-      }
-    }
+function render(barcodes) {
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  for (const barcode of barcodes) {
+    const location = toLocation(barcode.cornerPoints);
+    drawBox(location);
+    drawLabel(location, barcode.rawValue);
   }
-
-  return dedupeDetections(detections);
 }
 
-// Start offsets for tiles of TILE_SIZE covering `dimension`, stepping by
-// TILE_STEP and with a final tile flush against the far edge so the whole
-// frame is covered even when it doesn't divide evenly by the step.
-function getTilePositions(dimension) {
-  if (dimension <= TILE_SIZE) {
-    return [0];
-  }
-
-  const positions = [];
-  for (let pos = 0; pos + TILE_SIZE <= dimension; pos += TILE_STEP) {
-    positions.push(pos);
-  }
-
-  const lastPosition = dimension - TILE_SIZE;
-  if (positions[positions.length - 1] !== lastPosition) {
-    positions.push(lastPosition);
-  }
-
-  return positions;
-}
-
-function offsetQRCode(qrCode, offsetX, offsetY) {
-  const shift = (point) => ({ x: point.x + offsetX, y: point.y + offsetY });
-  const { topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner } = qrCode.location;
-
+// cornerPoints are ordered top-left, top-right, bottom-right, bottom-left.
+function toLocation([topLeft, topRight, bottomRight, bottomLeft]) {
   return {
-    data: qrCode.data,
-    location: {
-      topLeftCorner: shift(topLeftCorner),
-      topRightCorner: shift(topRightCorner),
-      bottomRightCorner: shift(bottomRightCorner),
-      bottomLeftCorner: shift(bottomLeftCorner),
-    },
-  };
-}
-
-// The same QR code is often found in more than one overlapping tile, so
-// collapse detections whose bounding boxes are centered near each other.
-function dedupeDetections(detections) {
-  const unique = [];
-
-  for (const detection of detections) {
-    const center = centerOf(detection.location);
-    const isDuplicate = unique.some((existing) => {
-      const existingCenter = centerOf(existing.location);
-      const dx = center.x - existingCenter.x;
-      const dy = center.y - existingCenter.y;
-      return Math.sqrt(dx * dx + dy * dy) < QR_SIZE;
-    });
-
-    if (!isDuplicate) {
-      unique.push(detection);
-    }
-  }
-
-  return unique;
-}
-
-function centerOf(location) {
-  const { topLeftCorner, bottomRightCorner } = location;
-  return {
-    x: (topLeftCorner.x + bottomRightCorner.x) / 2,
-    y: (topLeftCorner.y + bottomRightCorner.y) / 2,
+    topLeftCorner: topLeft,
+    topRightCorner: topRight,
+    bottomRightCorner: bottomRight,
+    bottomLeftCorner: bottomLeft,
   };
 }
 
