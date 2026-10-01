@@ -16,8 +16,19 @@ const VIDEO_CONSTRAINTS = {
 // fall back to the zxing-wasm based polyfill.
 const POLYFILL_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/+esm';
 
+const MEDIAPIPE_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21';
+const HAND_MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+const MAX_HANDS = 2;
+
 let detector;
 let isDetecting = false;
+let handLandmarker;
+let handConnections = [];
+let lastVideoTime = -1;
+
+// Latest results from each tracker, redrawn together on every frame.
+let barcodes = [];
+let hands = [];
 
 async function createDetector() {
   const formats = ['qr_code'];
@@ -29,6 +40,20 @@ async function createDetector() {
   }
   const { BarcodeDetector: Polyfill } = await import(POLYFILL_URL);
   return new Polyfill({ formats });
+}
+
+// Hand tracking is loaded in the background so a failure to fetch MediaPipe
+// never blocks QR tracking.
+async function createHandLandmarker() {
+  const { FilesetResolver, HandLandmarker } = await import(`${MEDIAPIPE_URL}/+esm`);
+  const fileset = await FilesetResolver.forVisionTasks(`${MEDIAPIPE_URL}/wasm`);
+  handConnections = HandLandmarker.HAND_CONNECTIONS;
+  const create = (delegate) => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate },
+    runningMode: 'VIDEO',
+    numHands: MAX_HANDS,
+  });
+  return create('GPU').catch(() => create('CPU'));
 }
 
 navigator.mediaDevices.getUserMedia(VIDEO_CONSTRAINTS)
@@ -45,27 +70,43 @@ video.addEventListener('loadedmetadata', async () => {
 
   detector = await createDetector();
   requestAnimationFrame(tick);
+
+  createHandLandmarker()
+    .then((landmarker) => { handLandmarker = landmarker; })
+    .catch((error) => console.error('Unable to load hand tracking:', error));
 });
 
 function tick() {
-  // Detection is async; skip frames while one is in flight rather than queue.
-  if (!isDetecting && video.readyState === video.HAVE_ENOUGH_DATA) {
-    isDetecting = true;
-    detector.detect(video)
-      .then(render)
-      .catch((error) => console.error('Detection failed:', error))
-      .finally(() => { isDetecting = false; });
+  if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    // Detection is async; skip frames while one is in flight rather than queue.
+    if (!isDetecting) {
+      isDetecting = true;
+      detector.detect(video)
+        .then((results) => { barcodes = results; })
+        .catch((error) => console.error('Detection failed:', error))
+        .finally(() => { isDetecting = false; });
+    }
+
+    // Hand detection is synchronous and only needs to run once per new frame.
+    if (handLandmarker && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      hands = handLandmarker.detectForVideo(video, performance.now()).landmarks;
+    }
   }
 
+  render();
   requestAnimationFrame(tick);
 }
 
-function render(barcodes) {
+function render() {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
   for (const barcode of barcodes) {
     const location = toLocation(barcode.cornerPoints);
     drawBox(location);
     drawLabel(location, barcode.rawValue);
+  }
+  for (const landmarks of hands) {
+    drawHand(landmarks);
   }
 }
 
@@ -110,4 +151,17 @@ function drawLabel(location, text) {
 
   overlayCtx.fillStyle = '#00ff00';
   overlayCtx.fillText(text, x, y);
+}
+
+// Landmarks are normalized to [0, 1], so scale them to the overlay.
+function drawHand(landmarks) {
+  overlayCtx.strokeStyle = '#ff0000';
+  overlayCtx.lineWidth = Math.max(4, overlay.width * 0.004);
+  overlayCtx.lineCap = 'round';
+  overlayCtx.beginPath();
+  for (const { start, end } of handConnections) {
+    overlayCtx.moveTo(landmarks[start].x * overlay.width, landmarks[start].y * overlay.height);
+    overlayCtx.lineTo(landmarks[end].x * overlay.width, landmarks[end].y * overlay.height);
+  }
+  overlayCtx.stroke();
 }
