@@ -19,6 +19,10 @@ const POLYFILL_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/+esm';
 const MEDIAPIPE_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21';
 const HAND_MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 const MAX_HANDS = 2;
+const INDEX_FINGER_TIP = 8;
+// A QR code is selected when an index fingertip is within this many pixels
+// (in video frame coordinates) of it.
+const SELECT_DISTANCE = 50;
 
 let detector;
 let isDetecting = false;
@@ -100,8 +104,16 @@ function tick() {
 
 function render() {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  const fingertips = hands.map((landmarks) => ({
+    x: landmarks[INDEX_FINGER_TIP].x * overlay.width,
+    y: landmarks[INDEX_FINGER_TIP].y * overlay.height,
+  }));
+
   for (const barcode of barcodes) {
     const location = toLocation(barcode.cornerPoints);
+    if (fingertips.some((tip) => isNear(tip, barcode.cornerPoints, SELECT_DISTANCE))) {
+      fillQuad(barcode.cornerPoints);
+    }
     drawBox(location);
     drawLabel(location, barcode.rawValue);
   }
@@ -164,4 +176,42 @@ function drawHand(landmarks) {
     overlayCtx.lineTo(landmarks[end].x * overlay.width, landmarks[end].y * overlay.height);
   }
   overlayCtx.stroke();
+}
+
+// True if the point is inside the polygon or within `distance` of its edge.
+function isNear(point, polygon, distance) {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if (distanceToSegment(point, a, b) <= distance) {
+      return true;
+    }
+    if ((a.y > point.y) !== (b.y > point.y) &&
+        point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function distanceToSegment(p, a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSquared = dx * dx + dy * dy;
+  const t = lengthSquared === 0
+    ? 0
+    : Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lengthSquared));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+function fillQuad(points) {
+  overlayCtx.fillStyle = 'rgba(255, 255, 153, 0.6)';
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(points[0].x, points[0].y);
+  for (const point of points.slice(1)) {
+    overlayCtx.lineTo(point.x, point.y);
+  }
+  overlayCtx.closePath();
+  overlayCtx.fill();
 }
