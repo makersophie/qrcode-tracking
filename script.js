@@ -23,6 +23,12 @@ const INDEX_FINGER_TIP = 8;
 // A QR code is selected when an index fingertip is within this many pixels
 // (in video frame coordinates) of it.
 const SELECT_DISTANCE = 50;
+// A code that drops out of selection for less than this long (a missed
+// detection or a jittery fingertip) is not announced again when it returns.
+const REANNOUNCE_MS = 1500;
+
+// QR contents -> last time (ms) that code was selected.
+const lastSelectedAt = new Map();
 
 let detector;
 let isDetecting = false;
@@ -113,6 +119,7 @@ function render() {
     const location = toLocation(barcode.cornerPoints);
     if (fingertips.some((tip) => isNear(tip, barcode.cornerPoints, SELECT_DISTANCE))) {
       fillQuad(barcode.cornerPoints);
+      announce(barcode.rawValue);
     }
     drawBox(location);
     drawLabel(location, barcode.rawValue);
@@ -215,3 +222,20 @@ function fillQuad(points) {
   overlayCtx.closePath();
   overlayCtx.fill();
 }
+
+function announce(text) {
+  const now = performance.now();
+  const last = lastSelectedAt.get(text);
+  lastSelectedAt.set(text, now);
+  if (last === undefined || now - last > REANNOUNCE_MS) {
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  }
+}
+
+// Browsers only allow speech after the user has interacted with the page, and
+// camera permission doesn't count, so prime it on the first tap or keypress.
+function unlockSpeech() {
+  window.speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+}
+window.addEventListener('pointerdown', unlockSpeech, { once: true });
+window.addEventListener('keydown', unlockSpeech, { once: true });
