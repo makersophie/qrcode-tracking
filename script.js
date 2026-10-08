@@ -14,8 +14,9 @@ const GROUP_COLOR = '#ffffff';
 // QR detection drops out for the odd frame, so a code is kept on screen until
 // it has gone unseen for this long. That stops names and groups flickering.
 const TRACK_LINGER_MS = 400;
-// After the finger leaves a code, its personality stays up this long.
-const REVEAL_LINGER_MS = 800;
+// After the finger leaves a code, its personality stays up this long, so a
+// shaky hand or a missed hand-tracking frame doesn't make it flicker.
+const REVEAL_LINGER_MS = 1500;
 // Two codes count as "together" when their centers are closer than this many
 // code-widths apart.
 const GROUP_DISTANCE = 2.2;
@@ -80,16 +81,37 @@ function getIndexFingertip() {
   return lastFingertip;
 }
 
-// Treats the finger as "pointing at" a code when its tip lands within one
-// code-width of the code's center — close enough to be unambiguous without
-// requiring pixel-perfect aim.
-function isPointingAt(fingertip, location) {
+// How close the fingertip must be to a code's center to count as pointing at
+// it: POINT_RANGE code-widths, but never less than POINT_MIN_RANGE on-screen
+// pixels so small or distant codes are still easy to hit.
+const POINT_RANGE = 1.8;
+const POINT_MIN_RANGE = 90;
+
+function pointingDistance(fingertip, location) {
+  const center = centerOf(location);
+  return Math.hypot(fingertip.x - center.x, fingertip.y - center.y);
+}
+
+function isInPointingRange(fingertip, location) {
+  const range = Math.max(widthOf(location) * POINT_RANGE, screenPx(POINT_MIN_RANGE));
+  return pointingDistance(fingertip, location) < range;
+}
+
+// With a generous range several codes can be within reach at once, so only
+// the one nearest the fingertip counts as pointed at.
+function findPointedCode(fingertip, codes) {
   if (!fingertip) {
-    return false;
+    return null;
   }
 
-  const center = centerOf(location);
-  return Math.hypot(fingertip.x - center.x, fingertip.y - center.y) < widthOf(location);
+  let nearest = null;
+  for (const code of codes) {
+    if (isInPointingRange(fingertip, code.location)
+      && (!nearest || pointingDistance(fingertip, code.location) < pointingDistance(fingertip, nearest.location))) {
+      nearest = code;
+    }
+  }
+  return nearest;
 }
 
 function drawFingertip(point) {
@@ -201,6 +223,7 @@ async function tick() {
 
     const groups = findGroups(codes.filter((code) => code.mouse));
     const grouped = new Set(groups.flat());
+    const pointedCode = findPointedCode(fingertip, codes.filter((code) => code.mouse && !grouped.has(code)));
 
     for (const group of groups) {
       drawGroup(group);
@@ -217,7 +240,7 @@ async function tick() {
       }
 
       // Mice in a group show the group's personality instead of their own.
-      if (!grouped.has(code) && isPointingAt(fingertip, location)) {
+      if (!grouped.has(code) && code === pointedCode) {
         code.revealUntil = now + REVEAL_LINGER_MS;
       }
 
