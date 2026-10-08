@@ -49,6 +49,13 @@ initHandLandmarker().catch((error) => {
   console.error('Unable to load hand tracking:', error);
 });
 
+// A finger moves far less between frames than it takes to run the model, so
+// the hand is only tracked every HAND_INTERVAL frames and the last fingertip
+// is reused in between. That frees time for QR scanning.
+const HAND_INTERVAL = 2;
+let handFrame = 0;
+let lastFingertip = null;
+
 // Landmark 8 is the index fingertip in MediaPipe's 21-point hand model.
 // Coordinates come back normalized (0-1) relative to the video frame.
 function getIndexFingertip() {
@@ -56,14 +63,21 @@ function getIndexFingertip() {
     return null;
   }
 
+  handFrame = (handFrame + 1) % HAND_INTERVAL;
+  if (handFrame !== 0) {
+    return lastFingertip;
+  }
+
   const result = handLandmarker.detectForVideo(video, performance.now());
   const landmarks = result.landmarks[0];
   if (!landmarks) {
+    lastFingertip = null;
     return null;
   }
 
   const tip = landmarks[8];
-  return { x: tip.x * sampleCanvas.width, y: tip.y * sampleCanvas.height };
+  lastFingertip = { x: tip.x * sampleCanvas.width, y: tip.y * sampleCanvas.height };
+  return lastFingertip;
 }
 
 // Treats the finger as "pointing at" a code when its tip lands within one
@@ -175,13 +189,13 @@ function updateTracked(detections, now) {
   }
 }
 
-function tick() {
+async function tick() {
   if (video.readyState === video.HAVE_ENOUGH_DATA) {
+    const detections = await detectCodes();
     const now = performance.now();
-    sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
-    updateTracked(scanForQRCodes(), now);
+    updateTracked(detections, now);
     const codes = [...tracked.values()];
     const fingertip = getIndexFingertip();
 
@@ -252,25 +266,101 @@ function areTogether(a, b) {
   return Math.hypot(centerA.x - centerB.x, centerA.y - centerB.y) < size * GROUP_DISTANCE;
 }
 
-function scanForQRCodes() {
-  const xs = getTilePositions(sampleCanvas.width);
-  const ys = getTilePositions(sampleCanvas.height);
+// The browser's built-in QR detector (Chrome on macOS and Android, among
+// others) finds every code in the frame in one hardware-accelerated call, so
+// it's used whenever available. jsQR is the fallback (e.g. iPhone Safari).
+let barcodeDetector = null;
+
+async function initBarcodeDetector() {
+  if (!('BarcodeDetector' in window)) {
+    return;
+  }
+  const formats = await BarcodeDetector.getSupportedFormats();
+  if (formats.includes('qr_code')) {
+    barcodeDetector = new BarcodeDetector({ formats: ['qr_code'] });
+  }
+}
+
+initBarcodeDetector().catch((error) => {
+  console.error('Native QR detection unavailable, using jsQR:', error);
+});
+
+async function detectCodes() {
+  if (barcodeDetector) {
+    try {
+      const codes = await barcodeDetector.detect(video);
+      return dedupeDetections(codes.map(({ rawValue, cornerPoints }) => {
+        const [topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner] = cornerPoints;
+        return { data: rawValue, location: { topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner } };
+      }));
+    } catch (error) {
+      console.error('Native QR detection failed, switching to jsQR:', error);
+      barcodeDetector = null;
+    }
+  }
+
+  sampleCtx.drawImage(video, 0, 0, sampleCanvas.width, sampleCanvas.height);
+  return dedupeDetections([...rescanTrackedCodes(), ...sweepNextTiles()]);
+}
+
+// With jsQR, decoding every tile of the frame is the slow part, so the sweep
+// that finds new codes is spread across SWEEP_FRAMES frames, a few tiles at a
+// time. Codes already found are re-decoded every frame, just in a small
+// window around where they last were.
+const SWEEP_FRAMES = 6;
+// Window size around a known code, in code-widths; leaves room for the code
+// to move between frames and for its quiet zone.
+const RESCAN_SCALE = 2.2;
+let sweepIndex = 0;
+
+function sweepNextTiles() {
+  const tiles = [];
+  for (const y of getTilePositions(sampleCanvas.height)) {
+    for (const x of getTilePositions(sampleCanvas.width)) {
+      tiles.push({ x, y });
+    }
+  }
+
+  const perFrame = Math.ceil(tiles.length / SWEEP_FRAMES);
+  if (sweepIndex >= tiles.length) {
+    sweepIndex = 0;
+  }
+  const batch = tiles.slice(sweepIndex, sweepIndex + perFrame);
+  sweepIndex += perFrame;
+
+  return batch
+    .map(({ x, y }) => decodeRegion(x, y, TILE_SIZE, TILE_SIZE))
+    .filter(Boolean);
+}
+
+function rescanTrackedCodes() {
   const detections = [];
 
-  for (const y of ys) {
-    for (const x of xs) {
-      const tile = sampleCtx.getImageData(x, y, TILE_SIZE, TILE_SIZE);
-      // Our codes are printed black-on-white, so skip jsQR's color-inverted
-      // decoding pass (its default) — it roughly doubles work per tile for
-      // a case we never hit.
-      const qrCode = jsQR(tile.data, TILE_SIZE, TILE_SIZE, { inversionAttempts: 'dontInvert' });
-      if (qrCode) {
-        detections.push(offsetQRCode(qrCode, x, y));
-      }
+  for (const code of tracked.values()) {
+    const center = centerOf(code.location);
+    const size = Math.min(
+      Math.ceil(widthOf(code.location) * RESCAN_SCALE),
+      sampleCanvas.width,
+      sampleCanvas.height,
+    );
+    const x = Math.round(Math.min(Math.max(center.x - size / 2, 0), sampleCanvas.width - size));
+    const y = Math.round(Math.min(Math.max(center.y - size / 2, 0), sampleCanvas.height - size));
+    const detection = decodeRegion(x, y, size, size);
+    if (detection) {
+      detections.push(detection);
     }
   }
 
   return dedupeDetections(detections);
+}
+
+function decodeRegion(x, y, width, height) {
+  const region = sampleCtx.getImageData(x, y, width, height);
+  // Our codes are printed black-on-white, so skip jsQR's color-inverted
+  // decoding pass (its default) — it roughly doubles work per region for a
+  // case we never hit.
+  const qrCode = jsQR(region.data, width, height, { inversionAttempts: 'dontInvert' });
+  return qrCode ? offsetQRCode(qrCode, x, y) : null;
 }
 
 // Start offsets for tiles of TILE_SIZE covering `dimension`, stepping by
