@@ -42,7 +42,13 @@ async function initHandLandmarker() {
       delegate: 'GPU',
     },
     runningMode: 'VIDEO',
-    numHands: 1,
+    // Track both hands so pointing works with either one, and accept
+    // lower-confidence hands than MediaPipe's 0.5 defaults: a hand that is
+    // partly out of frame or covering a code still counts.
+    numHands: 2,
+    minHandDetectionConfidence: 0.3,
+    minHandPresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3,
   });
 }
 
@@ -50,42 +56,38 @@ initHandLandmarker().catch((error) => {
   console.error('Unable to load hand tracking:', error);
 });
 
-// A finger moves far less between frames than it takes to run the model, so
-// the hand is only tracked every HAND_INTERVAL frames and the last fingertip
-// is reused in between. That frees time for QR scanning.
-const HAND_INTERVAL = 2;
-let handFrame = 0;
-let lastFingertip = null;
+// Hand tracking misses the odd frame, especially while a finger is over a
+// code, so the last fingertips are reused for this long before giving up.
+const FINGER_LINGER_MS = 300;
+let lastFingertips = [];
+let lastFingertipsAt = 0;
 
 // Landmark 8 is the index fingertip in MediaPipe's 21-point hand model.
 // Coordinates come back normalized (0-1) relative to the video frame.
-function getIndexFingertip() {
+// Returns one fingertip per detected hand.
+function getIndexFingertips(now) {
   if (!handLandmarker) {
-    return null;
+    return [];
   }
 
-  handFrame = (handFrame + 1) % HAND_INTERVAL;
-  if (handFrame !== 0) {
-    return lastFingertip;
+  const result = handLandmarker.detectForVideo(video, now);
+  if (result.landmarks.length > 0) {
+    lastFingertips = result.landmarks.map((landmarks) => ({
+      x: landmarks[8].x * sampleCanvas.width,
+      y: landmarks[8].y * sampleCanvas.height,
+    }));
+    lastFingertipsAt = now;
+  } else if (now - lastFingertipsAt > FINGER_LINGER_MS) {
+    lastFingertips = [];
   }
-
-  const result = handLandmarker.detectForVideo(video, performance.now());
-  const landmarks = result.landmarks[0];
-  if (!landmarks) {
-    lastFingertip = null;
-    return null;
-  }
-
-  const tip = landmarks[8];
-  lastFingertip = { x: tip.x * sampleCanvas.width, y: tip.y * sampleCanvas.height };
-  return lastFingertip;
+  return lastFingertips;
 }
 
 // How close the fingertip must be to a code's center to count as pointing at
 // it: POINT_RANGE code-widths, but never less than POINT_MIN_RANGE on-screen
 // pixels so small or distant codes are still easy to hit.
-const POINT_RANGE = 1.8;
-const POINT_MIN_RANGE = 90;
+const POINT_RANGE = 2.7;
+const POINT_MIN_RANGE = 135;
 
 function pointingDistance(fingertip, location) {
   const center = centerOf(location);
@@ -98,17 +100,17 @@ function isInPointingRange(fingertip, location) {
 }
 
 // With a generous range several codes can be within reach at once, so only
-// the one nearest the fingertip counts as pointed at.
-function findPointedCode(fingertip, codes) {
-  if (!fingertip) {
-    return null;
-  }
-
+// the code nearest a fingertip counts as pointed at.
+function findPointedCode(fingertips, codes) {
   let nearest = null;
-  for (const code of codes) {
-    if (isInPointingRange(fingertip, code.location)
-      && (!nearest || pointingDistance(fingertip, code.location) < pointingDistance(fingertip, nearest.location))) {
-      nearest = code;
+  let nearestDistance = Infinity;
+  for (const fingertip of fingertips) {
+    for (const code of codes) {
+      const distance = pointingDistance(fingertip, code.location);
+      if (distance < nearestDistance && isInPointingRange(fingertip, code.location)) {
+        nearest = code;
+        nearestDistance = distance;
+      }
     }
   }
   return nearest;
@@ -193,7 +195,12 @@ startCamera(currentFacingMode);
 // QR text -> { data, mouse, location, lastSeen, revealUntil }
 const tracked = new Map();
 
-function updateTracked(detections, now) {
+// Touching a code with a finger usually hides part of it, so the camera can
+// no longer read it. A code with a fingertip on it is kept on screen (at its
+// last position) for up to this long even though it isn't being decoded.
+const HOLD_UNDER_FINGER_MS = 5000;
+
+function updateTracked(detections, now, fingertips) {
   for (const { data, location } of detections) {
     const existing = tracked.get(data);
     if (existing) {
@@ -205,7 +212,10 @@ function updateTracked(detections, now) {
   }
 
   for (const [data, code] of tracked) {
-    if (now - code.lastSeen > TRACK_LINGER_MS) {
+    const unseenFor = now - code.lastSeen;
+    const underFinger = unseenFor < HOLD_UNDER_FINGER_MS
+      && fingertips.some((fingertip) => isInPointingRange(fingertip, code.location));
+    if (unseenFor > TRACK_LINGER_MS && !underFinger) {
       tracked.delete(data);
     }
   }
@@ -217,13 +227,13 @@ async function tick() {
     const now = performance.now();
     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
 
-    updateTracked(detections, now);
+    const fingertips = getIndexFingertips(now);
+    updateTracked(detections, now, fingertips);
     const codes = [...tracked.values()];
-    const fingertip = getIndexFingertip();
 
     const groups = findGroups(codes.filter((code) => code.mouse));
     const grouped = new Set(groups.flat());
-    const pointedCode = findPointedCode(fingertip, codes.filter((code) => code.mouse && !grouped.has(code)));
+    const pointedCode = findPointedCode(fingertips, codes.filter((code) => code.mouse && !grouped.has(code)));
 
     for (const group of groups) {
       drawGroup(group);
@@ -251,9 +261,7 @@ async function tick() {
       }
     }
 
-    if (fingertip) {
-      drawFingertip(fingertip);
-    }
+    fingertips.forEach(drawFingertip);
   }
 
   requestAnimationFrame(tick);
